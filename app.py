@@ -2,7 +2,6 @@ import os
 import time
 import sqlite3
 import html
-import io
 import hashlib
 import secrets
 import re
@@ -11,12 +10,19 @@ from flask import Flask, render_template_string, request, abort
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
-import dropbox
+from PIL import Image
+import boto3
+from botocore.exceptions import ClientError
 
 # ---------------- Configuration ----------------
-DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN")
-if not DROPBOX_TOKEN:
-    raise EnvironmentError("DROPBOX_TOKEN environment variable is required.")
+# R2 Credentials
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
+
+if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME]):
+    raise EnvironmentError("R2 environment variables are required.")
 
 UPLOAD_FOLDER = "uploads"
 PDF_FOLDER = "pdfs"
@@ -29,13 +35,21 @@ app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
 
-# Initialize Dropbox
+# Initialize R2 client
+s3_client = boto3.client(
+    's3',
+    endpoint_url=f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    region_name='auto'
+)
+
+# Verify R2 access on startup
 try:
-    dbx = dropbox.Dropbox(DROPBOX_TOKEN)
-    dbx.users_get_current_account()
-except Exception as e:
-    app.logger.error(f"Dropbox setup failed: {e}")
-    raise
+    s3_client.head_bucket(Bucket=R2_BUCKET_NAME)
+    print("✅ R2 bucket is accessible")
+except ClientError as e:
+    raise EnvironmentError(f"R2 bucket access failed: {e}")
 
 # ---------------- Agreements ----------------
 TEAM_AGREEMENT_TEXT = """LUNVEX LABS – CORE TEAM MEMBER AGREEMENT
@@ -139,19 +153,17 @@ def save_uploaded_file(file, prefix):
     return path
 
 def is_valid_image(fp):
-    from PIL import Image
     try:
         with Image.open(fp) as img:
             return img.format in ('JPEG', 'PNG')
     except:
         return False
 
-def upload_to_dropbox(local_path, dropbox_path):
-    with open(local_path, "rb") as f:
-        dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+def upload_to_r2(local_path, r2_key):
+    s3_client.upload_file(local_path, R2_BUCKET_NAME, r2_key)
 
-def backup_db():
-    upload_to_dropbox(DATABASE, f"/LunvexLabs/{DATABASE}")
+def backup_db_to_r2():
+    upload_to_r2(DATABASE, f"backups/{DATABASE}")
 
 # ---------------- Database ----------------
 def init_db():
@@ -228,6 +240,7 @@ def generate_internal_pdf(data, photo_path, signature_path, submission_id):
     txt = txt.replace("[Date]", data["applied_at"].split()[0])
     if data["role"] == "Internship":
         start = data["applied_at"].split()[0]
+        from datetime import timedelta
         end = (datetime.fromisoformat(data["applied_at"].replace(' ', 'T')) + timedelta(days=150)).strftime("%Y-%m-%d")
         txt = txt.replace("[Start Date]", start).replace("[End Date]", end)
 
@@ -295,6 +308,9 @@ def generate_receipt_pdf(name, role, email, submission_id):
     return pdf_path
 
 # ---------------- Templates ----------------
+# (HOME_TEMPLATE, APPLY_TEMPLATE, FAQ_TEMPLATE, INVESTORS_TEMPLATE remain exactly as in previous full code)
+# For brevity, they are included below in full.
+
 HOME_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -730,7 +746,6 @@ def apply():
         token = secrets.token_urlsafe(32)
         return render_template_string(APPLY_TEMPLATE, niches=NICHES, csrf_token=token)
 
-    # POST
     token = request.form.get('csrf_token')
     if not token or len(token) < 20:
         abort(400)
@@ -798,7 +813,6 @@ def apply():
             os.remove(signature_path)
             return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Already applied for this pathway.</h2>", 400
 
-        # Generate PDFs
         internal_pdf = generate_internal_pdf({
             "name": name,
             "email": email,
@@ -812,18 +826,13 @@ def apply():
 
         receipt_pdf = generate_receipt_pdf(name, role, email, submission_id)
 
-        # Dropbox: per-user folder
-        user_folder = f"/LunvexLabs/submissions/{submission_id}/"
-        try:
-            dbx.files_create_folder_v2(user_folder)
-        except:
-            pass  # folder may exist
-
-        upload_to_dropbox(internal_pdf, f"{user_folder}INTERNAL_RECORD.pdf")
-        upload_to_dropbox(receipt_pdf, f"{user_folder}RECEIPT.pdf")
-        upload_to_dropbox(photo_path, f"{user_folder}photo.jpg")
-        upload_to_dropbox(signature_path, f"{user_folder}signature.png")
-        backup_db()
+        # Upload to R2 with per-user prefix
+        user_prefix = f"submissions/{submission_id}/"
+        upload_to_r2(internal_pdf, f"{user_prefix}INTERNAL_RECORD.pdf")
+        upload_to_r2(receipt_pdf, f"{user_prefix}RECEIPT.pdf")
+        upload_to_r2(photo_path, f"{user_prefix}photo.jpg")
+        upload_to_r2(signature_path, f"{user_prefix}signature.png")
+        backup_db_to_r2()
 
         # Cleanup
         for f in [photo_path, signature_path, internal_pdf, receipt_pdf]:
@@ -868,7 +877,6 @@ def faqs():
 def investors():
     return render_template_string(INVESTORS_TEMPLATE)
 
-# ---------------- Run ----------------
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 10000))
