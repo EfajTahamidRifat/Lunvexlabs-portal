@@ -4,15 +4,14 @@ import sqlite3
 from flask import Flask, render_template_string, request
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, Frame
 import dropbox
 
 # ---------------- Configuration ----------------
 DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN")
 if not DROPBOX_TOKEN:
-    raise EnvironmentError(
-        "Missing DROPBOX_TOKEN environment variable. "
-        "Generate a token in your Dropbox App Console under 'Settings > Generated access token'."
-    )
+    raise EnvironmentError("DROPBOX_TOKEN environment variable is required.")
 
 UPLOAD_FOLDER = "uploads"
 PDF_FOLDER = "pdfs"
@@ -24,10 +23,83 @@ os.makedirs(PDF_FOLDER, exist_ok=True)
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# Initialize Dropbox client with minimal scope (files.content.write)
 dbx = dropbox.Dropbox(DROPBOX_TOKEN)
 
-# ---------------- Niches: Role & Stack-Based ----------------
+# ---------------- Agreements ----------------
+TEAM_AGREEMENT = """
+LUNVEX LABS – TEAM MEMBER AGREEMENT
+
+This Team Member Agreement (“Agreement”) is entered into on [Date] by and between:
+
+Lunvex Labs, a global technology initiative (“the Organization”), and [Full Name] (“the Member”).
+
+1. POSITION & ENGAGEMENT
+The Member is appointed as an official Team Member in the designated Niche and Specialization. This engagement is indefinite and continues until terminated per Section 5.
+
+2. CONFIDENTIALITY
+All non-public information accessed during the Member’s tenure is Confidential Information. The Member shall not disclose, reproduce, or exploit it without written authorization.
+
+3. INTELLECTUAL PROPERTY
+All work product developed in the course of duties for Lunvex Labs is the exclusive property of Lunvex Labs.
+
+4. COMPENSATION
+This role operates under a performance-driven reward model. No fixed salary is guaranteed. Bonuses, commissions, or equity may be offered at the Organization’s discretion.
+
+5. TERMINATION
+- Member may resign with 14 days’ written notice.
+- Lunvex Labs may terminate immediately for breach of conduct, inactivity, or security violations.
+
+6. COMMUNICATION
+Official communication occurs via verified Lunvex Labs channels (e.g., Telegram, email). Professional conduct is mandatory.
+
+ACCEPTED AND AGREED:
+[Full Name]
+Signature: _________________________
+Date: _________________________
+
+On behalf of Lunvex Labs:
+Dewan Efaj Tahamid Rifat
+Founder & Managing Director
+"""
+
+INTERNSHIP_AGREEMENT = """
+LUNVEX LABS – INTERNSHIP AGREEMENT
+
+This Internship Agreement (“Agreement”) is entered into on [Date] by and between:
+
+Lunvex Labs, a global technology initiative (“the Organization”), and [Full Name] (“the Intern”).
+
+1. TERM
+The internship lasts five (5) months from [Start Date] to [End Date]. Extension is at the Organization’s discretion.
+
+2. PURPOSE
+Provides hands-on experience in the selected Niche and Specialization under mentorship.
+
+3. CONFIDENTIALITY
+All non-public information received is Confidential Information and must not be disclosed.
+
+4. COMPENSATION & RECOGNITION
+- This is an unpaid educational internship.
+- Successful completion yields an Official Certificate of Completion.
+- Exceptional performers may be invited to join the Core Team.
+
+5. TERMINATION
+Lunvex Labs may terminate for misconduct, absenteeism, or breach. Intern may withdraw with 7 days’ notice.
+
+6. COMMUNICATION
+Official communication occurs via verified Lunvex Labs channels. Professionalism is required.
+
+ACCEPTED AND AGREED:
+[Full Name]
+Signature: _________________________
+Date: _________________________
+
+On behalf of Lunvex Labs:
+Dewan Efaj Tahamid Rifat
+Founder & Managing Director
+"""
+
+# ---------------- Niches ----------------
 NICHES = {
     "Web Development": [
         "Frontend Development",
@@ -138,6 +210,7 @@ def init_db():
             socials TEXT NOT NULL,
             photo TEXT NOT NULL,
             signature TEXT NOT NULL,
+            agreed BOOLEAN NOT NULL DEFAULT 0,
             status TEXT DEFAULT 'Pending'
         )
     """)
@@ -202,10 +275,15 @@ HTML_TEMPLATE = """
             box-sizing: border-box;
             font-size: 15px;
         }
-        input:focus, select:focus {
-            outline: none;
-            border-color: #3b82f6;
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+        .checkbox-group {
+            display: flex;
+            align-items: flex-start;
+            margin: 16px 0;
+        }
+        .checkbox-group input[type="checkbox"] {
+            width: auto;
+            margin-right: 10px;
+            margin-top: 4px;
         }
         button {
             background-color: #0ea5e9;
@@ -259,6 +337,14 @@ HTML_TEMPLATE = """
             <label>Signature (JPEG/PNG)</label>
             <input type="file" name="signature" accept="image/jpeg,image/png" required>
 
+            <div class="checkbox-group">
+                <input type="checkbox" name="agreement" id="agreement" required>
+                <label for="agreement" style="font-weight:normal;">
+                    I have read and agree to the Lunvex Labs 
+                    <span id="agreement-type">Team Member</span> Agreement.
+                </label>
+            </div>
+
             <button type="submit">Submit Application</button>
         </form>
     </div>
@@ -266,8 +352,14 @@ HTML_TEMPLATE = """
     <script>
         document.addEventListener('DOMContentLoaded', () => {
             const niches = {{ niches | tojson }};
+            const roleSelect = document.getElementById('role');
+            const agreementLabel = document.getElementById('agreement-type');
             const nicheSelect = document.getElementById('niche');
             const sectorSelect = document.getElementById('sector');
+
+            function updateAgreementText() {
+                agreementLabel.textContent = roleSelect.value === 'Team' ? 'Team Member' : 'Internship';
+            }
 
             function updateSectors() {
                 const selectedNiche = nicheSelect.value;
@@ -282,7 +374,9 @@ HTML_TEMPLATE = """
                 }
             }
 
+            roleSelect.addEventListener('change', updateAgreementText);
             nicheSelect.addEventListener('change', updateSectors);
+            updateAgreementText();
             updateSectors();
         });
     </script>
@@ -292,7 +386,6 @@ HTML_TEMPLATE = """
 
 # ---------------- Helpers ----------------
 def save_uploaded_file(file, prefix):
-    # Basic sanitization
     filename = file.filename.replace(' ', '_').replace('..', '').replace('/', '')
     if not filename:
         filename = "unnamed"
@@ -306,9 +399,11 @@ def generate_pdf(data, photo_path, signature_path):
     c = canvas.Canvas(pdf_path, pagesize=A4)
     width, height = A4
 
+    # Header
     c.setFont("Helvetica-Bold", 16)
     c.drawString(50, height - 50, "Lunvex Labs – Application Record")
 
+    # Applicant Info
     y = height - 90
     c.setFont("Helvetica", 12)
     fields = [
@@ -323,10 +418,43 @@ def generate_pdf(data, photo_path, signature_path):
         c.drawString(50, y, f"{label}: {value}")
         y -= 22
 
+    # Images
     if os.path.exists(photo_path):
         c.drawImage(photo_path, 50, y - 120, width=100, height=100)
     if os.path.exists(signature_path):
         c.drawImage(signature_path, 50, y - 240, width=200, height=50)
+
+    # Agreement
+    y = y - 280
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y, "AGREEMENT:")
+    y -= 20
+    c.setFont("Helvetica", 9)
+    agreement_text = TEAM_AGREEMENT if data["role"] == "Team" else INTERNSHIP_AGREEMENT
+    # Replace placeholder
+    agreement_text = agreement_text.replace("[Full Name]", data["name"])
+    agreement_text = agreement_text.replace("[Date]", time.strftime("%B %d, %Y"))
+
+    # Simple text wrapping
+    lines = []
+    for para in agreement_text.split('\n'):
+        if not para.strip():
+            lines.append("")
+        else:
+            while len(para) > 100:
+                split_at = para[:100].rfind(' ')
+                if split_at == -1:
+                    split_at = 100
+                lines.append(para[:split_at])
+                para = para[split_at:].lstrip()
+            lines.append(para)
+
+    for line in lines:
+        if y < 50:
+            c.showPage()
+            y = height - 50
+        c.drawString(50, y, line)
+        y -= 14
 
     c.save()
     return pdf_path
@@ -342,12 +470,16 @@ def index():
             niche = request.form.get("niche")
             sector = request.form.get("sector")
             socials = request.form.get("socials", "").strip()
+            agreed = request.form.get("agreement") == "on"
 
             if not all([name, email, role, niche, sector, socials]):
                 return "<h2 style='text-align:center;color:#ef4444;'>All fields are required.</h2>", 400
 
             if niche not in NICHES or sector not in NICHES[niche]:
                 return "<h2 style='text-align:center;color:#ef4444;'>Invalid niche or specialization.</h2>", 400
+
+            if not agreed:
+                return "<h2 style='text-align:center;color:#ef4444;'>You must agree to the agreement.</h2>", 400
 
             photo = request.files.get("photo")
             signature = request.files.get("signature")
@@ -360,9 +492,9 @@ def index():
             with get_db_connection() as conn:
                 conn.execute(
                     """INSERT INTO applicants 
-                    (name, email, role, niche, sector, socials, photo, signature)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (name, email, role, niche, sector, socials, photo_path, signature_path)
+                    (name, email, role, niche, sector, socials, photo, signature, agreed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (name, email, role, niche, sector, socials, photo_path, signature_path, True)
                 )
                 conn.commit()
 
@@ -382,7 +514,7 @@ def index():
             return """
             <div style="max-width:600px;margin:60px auto;text-align:center;font-family:sans-serif;color:#0f172a;">
                 <h2 style="color:#0ea5e9;">✅ Application Submitted</h2>
-                <p>Your application has been received and securely stored.</p>
+                <p>Your application and signed agreement have been securely stored.</p>
                 <p>Thank you for your interest in Lunvex Labs.</p>
             </div>
             """
@@ -392,7 +524,7 @@ def index():
             return """
             <div style="max-width:600px;margin:60px auto;text-align:center;font-family:sans-serif;color:#ef4444;">
                 <h2>❌ Submission Failed</h2>
-                <p>An unexpected error occurred. Please try again or contact support.</p>
+                <p>An unexpected error occurred. Please try again.</p>
             </div>
             """, 500
 
@@ -401,4 +533,5 @@ def index():
 # ---------------- Run ----------------
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
