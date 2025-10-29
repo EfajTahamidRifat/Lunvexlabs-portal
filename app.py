@@ -2,8 +2,12 @@ import os
 import time
 import sqlite3
 import html
-import imghdr
-from flask import Flask, render_template_string, request
+import io
+import hashlib
+import secrets
+import re
+from datetime import datetime, timezone
+from flask import Flask, render_template_string, request, abort
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
@@ -23,6 +27,7 @@ os.makedirs(PDF_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
 
 # Initialize Dropbox
 try:
@@ -33,38 +38,10 @@ except Exception as e:
     raise
 
 # ---------------- Agreements ----------------
-TEAM_AGREEMENT_HTML = """
-<h3>LUNVEX LABS – CORE TEAM MEMBER AGREEMENT</h3>
-<p><strong>This legally binding Agreement</strong> (“Agreement”) is entered into on [Date] by and between:</p>
-<p><strong>Lunvex Labs</strong>, a global technology initiative (“the Organization”), and <strong>[Full Name]</strong> (“the Member”).</p>
-<ol>
-  <li><strong>Engagement</strong><br>You are appointed as a Core Team Member in your declared Niche and Specialization. This is an indefinite, performance-based engagement.</li>
-  <li><strong>Confidentiality</strong><br>All non-public information (technical, strategic, or operational) is strictly confidential. Unauthorized disclosure constitutes grounds for immediate termination and legal action.</li>
-  <li><strong>Intellectual Property</strong><br>All work product, code, designs, or research created during your tenure is the sole and exclusive property of Lunvex Labs.</li>
-  <li><strong>Compensation</strong><br>This role is performance-driven. No fixed salary is provided. Rewards (bonuses, equity, or commissions) are discretionary and based on measurable impact.</li>
-  <li><strong>Termination</strong><br>• You may resign with 14 days’ written notice.<br>• Lunvex Labs reserves the right to terminate immediately for breach of conduct, inactivity (>14 days), or security violations.</li>
-  <li><strong>Professional Conduct</strong><br>All communication must occur via official Lunvex Labs channels (e.g., verified Telegram, email). Unprofessional behavior is not tolerated.</li>
-</ol>
-"""
-
-INTERNSHIP_AGREEMENT_HTML = """
-<h3>LUNVEX LABS – INTERNSHIP AGREEMENT</h3>
-<p><strong>This educational Agreement</strong> (“Agreement”) is entered into on [Date] by and between:</p>
-<p><strong>Lunvex Labs</strong>, a global technology initiative (“the Organization”), and <strong>[Full Name]</strong> (“the Intern”).</p>
-<ol>
-  <li><strong>Term</strong><br>5-month unpaid internship from [Start Date] to [End Date]. Extension is at the Organization’s sole discretion.</li>
-  <li><strong>Purpose</strong><br>Hands-on mentorship in your chosen Niche and Specialization to build real-world skills.</li>
-  <li><strong>Confidentiality</strong><br>All internal materials, tools, and communications are confidential. Disclosure is prohibited during and after the internship.</li>
-  <li><strong>Unpaid Nature</strong><br>This is a <strong>voluntary, unpaid educational program</strong>. No salary, stipend, or benefits are provided. Successful completion yields an Official Certificate.</li>
-  <li><strong>Pathway to Core Team</strong><br>Exceptional performers may receive an invitation to join the Core Team post-internship.</li>
-  <li><strong>Termination</strong><br>Lunvex Labs may terminate for misconduct, absenteeism, or breach. You may withdraw with 7 days’ notice.</li>
-</ol>
-"""
-
-TEAM_AGREEMENT_PDF = """LUNVEX LABS – CORE TEAM MEMBER AGREEMENT
+TEAM_AGREEMENT_TEXT = """LUNVEX LABS – CORE TEAM MEMBER AGREEMENT
 
 This legally binding Agreement (“Agreement”) is entered into on [Date] by and between:
-Lunvex Labs (“the Organization”) and [Full Name] (“the Member”).
+Lunvex Labs, founded by Dewan Efaj Tahamid Rifat (“the Organization”), and [Full Name] (“the Member”).
 
 1. ENGAGEMENT
 You are appointed as a Core Team Member in your declared Niche and Specialization. This is an indefinite, performance-based engagement.
@@ -83,13 +60,22 @@ This role is performance-driven. No fixed salary is provided. Rewards (bonuses, 
 - Lunvex Labs reserves the right to terminate immediately for breach of conduct, inactivity (>14 days), or security violations.
 
 6. PROFESSIONAL CONDUCT
-All communication must occur via official Lunvex Labs channels (e.g., verified Telegram, email). Unprofessional behavior is not tolerated.
+All communication must occur via official Lunvex Labs channels (e.g., verified Telegram: @EfajTahamidRIFAT). Unprofessional behavior is not tolerated.
+
+7. NO GUARANTEE OF SELECTION
+Submission of this application is strictly preliminary and non-binding. It does not constitute acceptance, selection, or any obligation on the part of Lunvex Labs.
+
+8. NON-INVESTOR STATUS
+Applicants acknowledge that participation does not confer equity, ownership, or investor rights. Investment opportunities are separate and require direct qualification.
+
+9. GOVERNING LAW
+This Agreement is governed by the laws of Singapore. Legal notices may be sent via Telegram to @EfajTahamidRIFAT.
 """
 
-INTERNSHIP_AGREEMENT_PDF = """LUNVEX LABS – INTERNSHIP AGREEMENT
+INTERNSHIP_AGREEMENT_TEXT = """LUNVEX LABS – INTERNSHIP AGREEMENT
 
 This educational Agreement (“Agreement”) is entered into on [Date] by and between:
-Lunvex Labs (“the Organization”) and [Full Name] (“the Intern”).
+Lunvex Labs, founded by Dewan Efaj Tahamid Rifat (“the Organization”), and [Full Name] (“the Intern”).
 
 1. TERM
 5-month unpaid internship from [Start Date] to [End Date]. Extension is at the Organization’s sole discretion.
@@ -108,9 +94,17 @@ Exceptional performers may receive an invitation to join the Core Team post-inte
 
 6. TERMINATION
 Lunvex Labs may terminate for misconduct, absenteeism, or breach. You may withdraw with 7 days’ notice.
+
+7. NO GUARANTEE OF SELECTION
+Submission of this application is strictly preliminary and non-binding. It does not constitute acceptance or selection.
+
+8. NON-INVESTOR STATUS
+Applicants acknowledge that participation does not confer equity, ownership, or investor rights.
+
+9. GOVERNING LAW
+This Agreement is governed by the laws of Singapore. Legal notices may be sent via Telegram to @EfajTahamidRIFAT.
 """
 
-# ---------------- Niches ----------------
 NICHES = {
     "Cybersecurity": {
         "Penetration Testing": ["Web App Pentesting", "Mobile App Pentesting", "Network Pentesting"],
@@ -122,171 +116,229 @@ NICHES = {
     },
 }
 
+# ---------------- Helpers ----------------
+def is_valid_github_url(url):
+    if not url or not url.startswith("https://github.com/"):
+        return False
+    pattern = r"^https://github\.com/([a-zA-Z0-9_-]+)(/?)$"
+    return bool(re.fullmatch(pattern, url.strip()))
+
+def secure_filename_custom(filename):
+    safe = "".join(c for c in filename if c.isalnum() or c in "._- ")
+    return safe.strip().replace(' ', '_') or "file"
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'png', 'jpg', 'jpeg'}
+
+def save_uploaded_file(file, prefix):
+    if not file or not file.filename:
+        raise ValueError("No file")
+    orig = secure_filename_custom(file.filename)
+    path = os.path.join(app.config["UPLOAD_FOLDER"], f"{prefix}_{int(time.time())}_{orig}")
+    file.save(path)
+    return path
+
+def is_valid_image(fp):
+    from PIL import Image
+    try:
+        with Image.open(fp) as img:
+            return img.format in ('JPEG', 'PNG')
+    except:
+        return False
+
+def upload_to_dropbox(local_path, dropbox_path):
+    with open(local_path, "rb") as f:
+        dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+
+def backup_db():
+    upload_to_dropbox(DATABASE, f"/LunvexLabs/{DATABASE}")
+
 # ---------------- Database ----------------
 def init_db():
     conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    cursor.execute("""
+    c = conn.cursor()
+    c.execute("""
         CREATE TABLE IF NOT EXISTS applicants (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            submission_id TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
             email TEXT NOT NULL,
             role TEXT NOT NULL CHECK(role IN ('CoreTeam', 'Internship')),
             niche TEXT NOT NULL,
             sector TEXT NOT NULL,
             subsector TEXT,
-            socials TEXT NOT NULL,
-            photo TEXT NOT NULL,
-            signature TEXT NOT NULL,
+            github_url TEXT NOT NULL,
+            photo_path TEXT NOT NULL,
+            signature_path TEXT NOT NULL,
             agreed BOOLEAN NOT NULL DEFAULT 1,
-            status TEXT DEFAULT 'Pending',
-            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            applied_at TEXT NOT NULL,
             UNIQUE(email, role)
         )
     """)
     conn.commit()
     conn.close()
 
-def get_db_connection():
+def get_db():
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
 
-def is_valid_image(filepath):
-    return imghdr.what(filepath) in ('jpeg', 'png')
-
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def save_uploaded_file(file, prefix):
-    filename = file.filename.strip().replace(' ', '_').replace('..', '').replace('/', '')
-    if not filename:
-        filename = "unnamed"
-    path = os.path.join(app.config["UPLOAD_FOLDER"], f"{prefix}_{int(time.time())}_{filename}")
-    file.save(path)
-    return path
-
 # ---------------- PDF Generators ----------------
-def generate_agreement_pdf(data, photo_path, signature_path):
-    pdf_filename = f"AGREEMENT_{data['name'].replace(' ', '_')}_{int(time.time())}.pdf"
-    pdf_path = os.path.join(PDF_FOLDER, pdf_filename)
+def generate_internal_pdf(data, photo_path, signature_path, submission_id):
+    pdf_path = os.path.join(PDF_FOLDER, f"INTERNAL_{submission_id}.pdf")
     c = canvas.Canvas(pdf_path, pagesize=A4)
-    width, height = A4
+    w, h = A4
 
     c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, height - 50, "Lunvex Labs – Application Record")
+    c.drawString(50, h - 50, "Lunvex Labs – Internal Application Record")
+    c.setFont("Helvetica", 10)
+    c.setFillColor(colors.gray)
+    c.drawString(50, h - 70, f"Submission ID: {submission_id} | {data['applied_at']} UTC")
 
-    y = height - 90
-    c.setFont("Helvetica", 12)
-    role_display = "Core Team Member" if data["role"] == "CoreTeam" else "Intern"
+    y = h - 110
+    c.setFont("Helvetica-Bold", 12)
+    c.setFillColor(colors.black)
+    c.drawString(50, y, "APPLICANT DETAILS")
+    y -= 20
+    c.setFont("Helvetica", 11)
+
     fields = [
         ("Name", data["name"]),
         ("Email", data["email"]),
-        ("Role", role_display),
+        ("GitHub", data["github_url"]),
+        ("Role", "Core Team" if data["role"] == "CoreTeam" else "Intern"),
         ("Niche", data["niche"]),
         ("Specialization", data["sector"]),
         ("Sub-Sector", data.get("subsector") or "N/A"),
-        ("Social Links", data["socials"])
     ]
-    for label, value in fields:
-        c.drawString(50, y, f"{label}: {value}")
-        y -= 22
+    for label, val in fields:
+        c.drawString(50, y, f"{label}:")
+        c.drawString(180, y, str(val)[:80])
+        y -= 20
 
-    if os.path.exists(photo_path):
-        c.drawImage(photo_path, 50, y - 120, width=100, height=100)
-    if os.path.exists(signature_path):
-        c.drawImage(signature_path, 50, y - 240, width=200, height=50)
-
-    y = y - 280
+    # Agreement
+    y = y - 20
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, y, "AGREEMENT:")
-    y -= 20
+    c.drawString(50, y, "ACCEPTED AGREEMENT")
+    y -= 25
     c.setFont("Helvetica", 9)
 
-    agreement_text = TEAM_AGREEMENT_PDF if data["role"] == "CoreTeam" else INTERNSHIP_AGREEMENT_PDF
-    agreement_text = agreement_text.replace("[Full Name]", data["name"])
-    agreement_text = agreement_text.replace("[Date]", time.strftime("%B %d, %Y"))
+    txt = TEAM_AGREEMENT_TEXT if data["role"] == "CoreTeam" else INTERNSHIP_AGREEMENT_TEXT
+    txt = txt.replace("[Full Name]", data["name"])
+    txt = txt.replace("[Date]", data["applied_at"].split()[0])
+    if data["role"] == "Internship":
+        start = data["applied_at"].split()[0]
+        end = (datetime.fromisoformat(data["applied_at"].replace(' ', 'T')) + timedelta(days=150)).strftime("%Y-%m-%d")
+        txt = txt.replace("[Start Date]", start).replace("[End Date]", end)
 
-    for line in agreement_text.split('\n'):
-        if y < 50:
+    for line in txt.split('\n'):
+        if y < 60:
             c.showPage()
-            y = height - 50
-        c.drawString(50, y, line[:100])
+            y = h - 50
+        c.drawString(50, y, line[:90])
         y -= 14
 
+    # Watermark
+    c.saveState()
+    c.setFont("Helvetica", 40)
+    c.setFillColorRGB(0.9, 0.9, 0.9, 0.5)
+    c.drawCentredString(w / 2, h / 2, "CONFIDENTIAL")
+    c.restoreState()
     c.save()
     return pdf_path
 
-def generate_verification_pdf(name, role, email, submission_id):
-    filename = f"VERIFICATION_{name.replace(' ', '_')}_{int(time.time())}.pdf"
-    filepath = os.path.join(PDF_FOLDER, filename)
-    c = canvas.Canvas(filepath, pagesize=A4)
-    width, height = A4
+def generate_receipt_pdf(name, role, email, submission_id):
+    pdf_path = os.path.join(PDF_FOLDER, f"RECEIPT_{submission_id}.pdf")
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    w, h = A4
 
-    # Header background
-    c.setFillColor(colors.Color(0.05, 0.1, 0.2, alpha=0.92))
-    c.rect(0, height - 120, width, 120, fill=1, stroke=0)
-
-    # Logo text
+    c.setFillColor(colors.Color(0.05, 0.1, 0.2, alpha=0.95))
+    c.rect(0, h - 100, w, 100, fill=1)
     c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 28)
-    c.drawCentredString(width / 2, height - 60, "LUNVEX LABS")
-    c.setFont("Helvetica", 14)
-    c.setFillColor(colors.Color(0.7, 0.85, 0.95))
-    c.drawCentredString(width / 2, height - 85, "Global Technology Initiative")
-
-    # Success message
-    c.setFillColor(colors.Color(0.05, 0.1, 0.2))
-    c.setFont("Helvetica-Bold", 22)
-    c.drawCentredString(width / 2, height - 160, "✅ Application Submitted")
-
-    # Details
+    c.setFont("Helvetica-Bold", 26)
+    c.drawCentredString(w / 2, h - 50, "LUNVEX LABS")
     c.setFont("Helvetica", 12)
-    y = height - 200
+    c.setFillColor(colors.Color(0.8, 0.9, 1.0))
+    c.drawCentredString(w / 2, h - 75, "Global Technology Initiative")
+
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawCentredString(w / 2, h - 130, "✅ Application Submitted")
+
+    y = h - 170
     info = [
-        f"Applicant: {name}",
+        f"Applicant: {html.escape(name)}",
         f"Pathway: {'Core Team' if role == 'CoreTeam' else 'Internship'}",
-        f"Email: {email}",
+        f"Email: {html.escape(email)}",
         f"Submission ID: {submission_id}",
-        f"Submitted: {time.strftime('%B %d, %Y at %I:%M %p UTC')}"
+        f"Submitted: {datetime.now(timezone.utc).strftime('%B %d, %Y at %I:%M %p UTC')}"
     ]
     for line in info:
         c.drawString(80, y, line)
-        y -= 24
+        y -= 28
 
-    # Footer
-    c.setFillColor(colors.gray)
-    c.setFont("Helvetica", 10)
-    c.drawCentredString(width / 2, 80, "This is an automated verification receipt. Keep it for your records.")
-
-    # Accent bar
+    c.setFont("Helvetica", 12)
     c.setFillColor(colors.Color(0.05, 0.65, 0.9))
-    c.rect(0, 0, width, 10, fill=1, stroke=0)
+    c.drawString(80, y - 20, "Next Step:")
+    c.setFont("Helvetica", 11)
+    c.setFillColor(colors.black)
+    c.drawString(80, y - 40, "Contact the Founder on Telegram for confirmation:")
+    c.setFillColor(colors.blue)
+    c.drawString(80, y - 60, "@EfajTahamidRIFAT")
 
+    c.setFillColor(colors.gray)
+    c.setFont("Helvetica", 9)
+    c.drawCentredString(w / 2, 50, "This receipt confirms submission only. No selection is guaranteed.")
+    c.setFillColor(colors.Color(0.05, 0.65, 0.9))
+    c.rect(0, 0, w, 8, fill=1)
     c.save()
-    return filepath
+    return pdf_path
 
-# ---------------- HTML Template ----------------
-HTML_TEMPLATE = """
+# ---------------- Templates ----------------
+HOME_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Join Lunvex Labs | Global Tech Talent</title>
-    <meta name="description" content="Apply to Lunvex Labs' Core Team or Internship Program. Performance-driven, global, and confidential.">
-    <link rel="preload" href="https://i.ibb.co/jktGByvB/grok-image-jw1wft.jpg" as="image">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <title>Lunvex Labs | We Are Hiring</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/tsparticles@2.12.0/tsparticles.bundle.min.js"></script>
+    <style> body { font-family: 'Inter', sans-serif; background: #0f172a; color: white; margin: 0; padding: 0; }
+        .hero { text-align: center; padding: 80px 20px; }
+        .hero h1 { font-size: 48px; margin-bottom: 20px; color: #0ea5e9; }
+        .hero p { font-size: 20px; max-width: 700px; margin: 0 auto 40px; color: #cbd5e1; }
+        .nav { display: flex; justify-content: center; gap: 30px; margin-bottom: 60px; }
+        .nav a { color: #94a3b8; text-decoration: none; font-weight: 500; }
+        .nav a:hover { color: #0ea5e9; }
+        .btn { display: inline-block; background: #0ea5e9; color: white; padding: 14px 32px; border-radius: 12px; text-decoration: none; font-weight: 600; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="hero">
+        <h1>We Are Hiring</h1>
+        <p>Lunvex Labs is seeking exceptional global talent for its Core Team and Internship Program in Cybersecurity, AI, Web3, and more.</p>
+        <a href="/apply" class="btn">Apply Now</a>
+    </div>
+    <div class="nav">
+        <a href="/">Home</a>
+        <a href="/apply">Apply</a>
+        <a href="/faqs">FAQs</a>
+        <a href="/investors">Investors</a>
+    </div>
+</body>
+</html>
+"""
+
+APPLY_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Apply | Lunvex Labs</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        :root {
-            --primary: #0ea5e9;
-            --primary-light: #bae6fd;
-            --gray-900: #0f172a;
-        }
+        :root { --primary: #0ea5e9; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Inter', sans-serif;
@@ -294,135 +346,79 @@ HTML_TEMPLATE = """
             color: white;
             min-height: 100vh;
             padding: 20px;
-            display: flex;
-            justify-content: center;
-            align-items: flex-start;
-            position: relative;
-            overflow-x: hidden;
         }
-        #tsparticles { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: -1; }
-        #app-loader {
-            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-            display: flex; justify-content: center; align-items: center;
-            z-index: 10000; opacity: 1; visibility: visible;
-            transition: opacity 0.6s ease, visibility 0.6s ease;
-        }
-        #app-loader.hidden { opacity: 0; visibility: hidden; }
-        .loader {
-            width: 160px; height: 185px; position: relative; background: #fff;
-            border-radius: 100px 100px 0 0;
-        }
-        .loader:after {
-            content: ""; position: absolute; width: 100px; height: 125px; left: 50%; top: 25px; transform: translateX(-50%);
-            background-image: radial-gradient(circle, #000 48%, transparent 55%),
-                radial-gradient(circle, #000 48%, transparent 55%),
-                radial-gradient(circle, #fff 30%, transparent 45%),
-                radial-gradient(circle, #000 48%, transparent 51%),
-                linear-gradient(#000 20px, transparent 0),
-                linear-gradient(#cfecf9 60px, transparent 0),
-                radial-gradient(circle, #cfecf9 50%, transparent 51%),
-                radial-gradient(circle, #cfecf9 50%, transparent 51%);
-            background-repeat: no-repeat;
-            background-size: 16px 16px, 16px 16px, 10px 10px, 42px 42px, 12px 3px,
-                50px 25px, 70px 70px, 70px 70px;
-            background-position: 25px 10px, 55px 10px, 36px 44px, 50% 30px, 50% 85px,
-                50% 50px, 50% 22px, 50% 45px;
-            animation: faceLift 3s linear infinite alternate;
-        }
-        .loader:before {
-            content: ""; position: absolute; width: 140%; height: 125px; left: -20%; top: 0;
-            background-image: radial-gradient(circle, #fff 48%, transparent 50%),
-                radial-gradient(circle, #fff 48%, transparent 50%);
-            background-repeat: no-repeat;
-            background-size: 65px 65px;
-            background-position: 0px 12px, 145px 12px;
-            animation: earLift 3s linear infinite alternate;
-        }
-        @keyframes faceLift { 0% { transform: translateX(-60%); } 100% { transform: translateX(-30%); } }
-        @keyframes earLift { 0% { transform: translateX(10px); } 100% { transform: translateX(0px); } }
-
         .card {
-            background: rgba(255, 255, 255, 0.08);
+            background: rgba(15, 23, 42, 0.7);
             backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(255,255,255,0.1);
             border-radius: 20px;
             padding: 32px;
-            margin-bottom: 28px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2), inset 0 0 0 1px rgba(255, 255, 255, 0.05);
-            transition: transform 0.35s cubic-bezier(0.23, 1, 0.32, 1), box-shadow 0.35s ease;
-            position: relative;
-            overflow: hidden;
+            margin: 40px auto;
             max-width: 800px;
             width: 100%;
         }
-        .card:hover { transform: translateY(-6px); box-shadow: 0 14px 36px rgba(0, 0, 0, 0.3), inset 0 0 0 1px rgba(255, 255, 255, 0.08); }
-        .card::before {
-            content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px;
-            background: linear-gradient(90deg, #0ea5e9, #38bdf8, #0ea5e9);
-            background-size: 200% 100%; animation: cardGlow 3s linear infinite; opacity: 0.7;
-        }
-        @keyframes cardGlow { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-        .agreement-card { padding: 28px !important; margin-top: 12px; }
-        h1 { font-weight: 700; font-size: 28px; text-align: center; color: white; margin-bottom: 8px; }
-        .subtitle { text-align: center; color: rgba(255,255,255,0.85); font-size: 16px; margin-bottom: 28px; line-height: 1.5; }
-        .logo { display: block; margin: 0 auto 20px; max-width: 140px; filter: drop-shadow(0 2px 8px rgba(0,0,0,0.3)); }
-        .path-card {
-            background: rgba(14, 165, 233, 0.08);
-            border-left: 3px solid #0ea5e9;
-            padding: 14px;
-            border-radius: 0 12px 12px 0;
-            margin: 16px 0;
-            font-size: 14px;
-        }
-        label { display: block; margin-top: 20px; font-weight: 600; font-size: 14px; color: white; }
-        input, select, button {
-            width: 100%; padding: 14px 18px; margin-top: 8px; margin-bottom: 22px;
-            border: 1px solid rgba(255,255,255,0.2); border-radius: 14px;
-            font-size: 15px; font-family: inherit;
-            background: rgba(255,255,255,0.06); color: white;
-            transition: all 0.3s ease; backdrop-filter: blur(4px);
-        }
-        input:focus, select:focus {
-            outline: none; border-color: var(--primary);
+        h1 { font-weight: 700; font-size: 28px; text-align: center; margin-bottom: 10px; }
+        .pathway-info {
             background: rgba(14, 165, 233, 0.15);
-            box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.3);
+            padding: 14px;
+            border-radius: 12px;
+            font-size: 14px;
+            margin-bottom: 24px;
+            line-height: 1.5;
+        }
+        label { display: block; margin-top: 20px; font-weight: 600; font-size: 14px; }
+        input, select, button {
+            width: 100%; padding: 14px; margin-top: 8px; margin-bottom: 22px;
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 12px;
+            font-size: 15px;
+            background: rgba(0,0,0,0.2);
+            color: white;
         }
         button {
             background: linear-gradient(135deg, #0ea5e9, #38bdf8);
-            color: white; font-weight: 600; border: none; cursor: pointer;
-            letter-spacing: -0.01em; box-shadow: 0 4px 20px rgba(14, 165, 233, 0.4);
+            color: white;
+            font-weight: 600;
+            border: none;
+            cursor: pointer;
         }
-        .checkbox-group {
-            display: flex; align-items: flex-start; margin: 24px 0;
-        }
+        .checkbox-group { display: flex; align-items: flex-start; margin: 24px 0; }
         .checkbox-group input[type="checkbox"] {
-            width: auto; margin-right: 14px; margin-top: 4px; accent-color: var(--primary); transform: scale(1.1);
+            width: auto; margin-right: 14px; margin-top: 4px; accent-color: var(--primary);
         }
-        .consent-note {
-            font-size: 13px; color: rgba(255,255,255,0.7); margin-top: -12px; margin-bottom: 16px; font-style: italic;
+        .notice {
+            background: rgba(56, 189, 248, 0.15);
+            border-left: 4px solid #0ea5e9;
+            padding: 16px;
+            border-radius: 0 8px 8px 0;
+            margin: 24px 0;
+            font-size: 14px;
+            line-height: 1.5;
         }
-        @media (max-width: 600px) { .card { padding: 24px 16px; } h1 { font-size: 24px; } }
+        .nav { text-align: center; margin-bottom: 20px; }
+        .nav a { color: #94a3b8; text-decoration: none; margin: 0 15px; }
+        .nav a:hover { color: #0ea5e9; }
     </style>
 </head>
 <body>
-    <div id="app-loader"><div class="loader"></div></div>
-    <div id="tsparticles"></div>
+    <div class="nav">
+        <a href="/">Home</a> | 
+        <a href="/apply">Apply</a> | 
+        <a href="/faqs">FAQs</a> | 
+        <a href="/investors">Investors</a>
+    </div>
 
     <div class="card">
-        <img src="https://i.ibb.co/jktGByvB/grok-image-jw1wft.jpg" alt="Lunvex Labs" class="logo">
-        <h1>Join Lunvex Labs</h1>
-        <p class="subtitle">Contribute to cutting-edge global projects. Choose your pathway below.</p>
-
-        <div class="path-card"><strong>Core Team</strong>: Performance-driven, indefinite engagement. No fixed salary. Rewards based on impact.</div>
-        <div class="path-card"><strong>Internship</strong>: 5-month unpaid educational program. Certificate upon completion. Pathway to Core Team.</div>
-
-        <div class="card agreement-card" id="agreement-preview">
-            <p>Please select your pathway to review the full agreement.</p>
+        <h1>Apply to Lunvex Labs</h1>
+        
+        <div class="pathway-info">
+            <strong>Core Team</strong>: Performance-driven role. No salary. Discretionary rewards.<br>
+            <strong>Internship</strong>: 5-month unpaid program. Certificate issued. Top performers may join Core Team.
         </div>
 
         <form method="post" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            
             <label for="role">I want to...</label>
             <select name="role" id="role" required>
                 <option value="">Select your pathway</option>
@@ -431,10 +427,10 @@ HTML_TEMPLATE = """
             </select>
 
             <label for="name">Full Name</label>
-            <input type="text" name="name" id="name" required>
+            <input type="text" name="name" id="name" required maxlength="100">
 
             <label for="email">Email</label>
-            <input type="email" name="email" id="email" required>
+            <input type="email" name="email" id="email" required maxlength="100">
 
             <label for="niche">Niche</label>
             <select name="niche" id="niche" required>
@@ -454,84 +450,50 @@ HTML_TEMPLATE = """
                 <option value="">Not Applicable</option>
             </select>
 
-            <label for="socials">Social Links (LinkedIn, GitHub, Portfolio, etc.)</label>
-            <input type="text" name="socials" id="socials" placeholder="https://linkedin.com/in/..., https://github.com/..." required>
+            <label for="socials">GitHub Profile (Required)</label>
+            <input type="url" name="socials" id="socials" placeholder="https://github.com/your-username" required maxlength="100" pattern="https://github\.com/([a-zA-Z0-9_-]+)/?$">
+            <p style="font-size:13px;color:#94a3b8;margin-top:6px;">
+              🔒 Only public GitHub profiles accepted. Used for technical verification.
+            </p>
 
-            <label>Photo (JPEG/PNG)</label>
+            <label>Photo (JPEG/PNG, max 5MB)</label>
             <input type="file" name="photo" accept="image/jpeg,image/png" required>
 
-            <label>Signature (JPEG/PNG)</label>
+            <label>Signature (JPEG/PNG, max 5MB)</label>
             <input type="file" name="signature" accept="image/jpeg,image/png" required>
 
             <div class="checkbox-group" id="unpaid-ack" style="display:none;">
                 <input type="checkbox" name="unpaid_ack" id="unpaid_ack" required>
-                <label for="unpaid_ack" style="font-weight:500; color:white; margin-top: 2px;">
+                <label for="unpaid_ack" style="font-weight:500;">
                     I understand this is an unpaid educational internship and confirm my voluntary participation.
                 </label>
             </div>
 
             <div class="checkbox-group">
                 <input type="checkbox" name="agreement" id="agreement" required>
-                <label for="agreement" style="font-weight:500; color:white; margin-top: 2px;">
-                    I have read, understood, and agree to the above agreement and Lunvex Labs' operational policies.
+                <label for="agreement" style="font-weight:500;">
+                    I have read and agree to the Lunvex Labs Agreement and policies.
                 </label>
             </div>
-            <p class="consent-note">
-                By submitting, you consent to the storage and processing of your data for recruitment purposes.
-            </p>
+
+            <div class="notice">
+              📌 <strong>This submission is not final.</strong><br>
+              It is a preliminary expression of interest only.<br>
+              <strong>No selection, offer, or engagement is guaranteed.</strong><br>
+              Only shortlisted candidates will be contacted by the Founder on Telegram.
+            </div>
 
             <button type="submit">Submit Application</button>
         </form>
     </div>
 
     <script>
-        tsParticles.load("tsparticles", {
-            fpsLimit: 60,
-            particles: {
-                number: { value: 80, density: { enable: true, area: 800 } },
-                color: { value: "#0ea5e9" },
-                shape: { type: "circle" },
-                opacity: { value: 0.3, random: true },
-                size: { value: { min: 1, max: 3 } },
-                move: {
-                    enable: true,
-                    speed: 1,
-                    direction: "none",
-                    random: true,
-                    straight: false,
-                    outModes: "out"
-                }
-            },
-            interactivity: {
-                detectsOn: "canvas",
-                events: {
-                    onHover: { enable: true, mode: "repulse" },
-                    onClick: { enable: true, mode: "push" },
-                    resize: true
-                }
-            },
-            detectRetina: true
-        });
-
-        const TEAM_AGREEMENT = {{ team_agreement | tojson }};
-        const INTERNSHIP_AGREEMENT = {{ internship_agreement | tojson }};
         const NICHES_DATA = {{ niches | tojson }};
-
-        const agreementPreview = document.getElementById('agreement-preview');
         const roleSelect = document.getElementById('role');
         const nicheSelect = document.getElementById('niche');
         const sectorSelect = document.getElementById('sector');
         const subsectorSelect = document.getElementById('subsector');
         const unpaidAck = document.getElementById('unpaid-ack');
-
-        function updateAgreement() {
-            const role = roleSelect.value;
-            agreementPreview.innerHTML = role === 'CoreTeam' ? TEAM_AGREEMENT : 
-                                        role === 'Internship' ? INTERNSHIP_AGREEMENT : 
-                                        '<p>Please select your pathway to review the full agreement.</p>';
-            agreementPreview.style.animation = 'none';
-            setTimeout(() => { agreementPreview.style.animation = 'fadeInUp 0.7s ease forwards'; }, 10);
-        }
 
         function updateSectors() {
             const niche = nicheSelect.value;
@@ -561,143 +523,353 @@ HTML_TEMPLATE = """
             }
         }
 
-        roleSelect.addEventListener('change', function() {
-            updateAgreement();
-            unpaidAck.style.display = this.value === 'Internship' ? 'flex' : 'none';
+        roleSelect.addEventListener('change', () => {
+            unpaidAck.style.display = roleSelect.value === 'Internship' ? 'flex' : 'none';
         });
         nicheSelect.addEventListener('change', updateSectors);
         sectorSelect.addEventListener('change', updateSubsectors);
-
-        updateAgreement();
-
-        window.addEventListener('load', () => {
-            setTimeout(() => document.getElementById('app-loader')?.classList.add('hidden'), 600);
-        });
     </script>
 </body>
 </html>
 """
 
+FAQ_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FAQs | Lunvex Labs</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background: #0f172a; color: white; margin: 0; padding: 0; }
+        .container { max-width: 800px; margin: 40px auto; padding: 0 20px; }
+        h1 { text-align: center; margin-bottom: 40px; color: #0ea5e9; }
+        .faq { margin-bottom: 24px; padding-bottom: 24px; border-bottom: 1px solid #334155; }
+        .faq h3 { margin-bottom: 10px; color: #f1f5f9; }
+        .faq p { color: #cbd5e1; line-height: 1.6; }
+        .nav { text-align: center; margin-bottom: 30px; }
+        .nav a { color: #94a3b8; text-decoration: none; margin: 0 15px; }
+        .nav a:hover { color: #0ea5e9; }
+    </style>
+</head>
+<body>
+    <div class="nav">
+        <a href="/">Home</a> | 
+        <a href="/apply">Apply</a> | 
+        <a href="/faqs">FAQs</a> | 
+        <a href="/investors">Investors</a>
+    </div>
+    <div class="container">
+        <h1>Frequently Asked Questions</h1>
+        
+        <div class="faq">
+            <h3>Is the internship paid?</h3>
+            <p>No. The internship is an unpaid educational program designed to provide hands-on experience. Exceptional performers may be invited to join the Core Team.</p>
+        </div>
+        
+        <div class="faq">
+            <h3>Is the Core Team role salaried?</h3>
+            <p>No. Core Team roles are performance-driven. Compensation (bonuses, equity, commissions) is discretionary and based on measurable impact.</p>
+        </div>
+        
+        <div class="faq">
+            <h3>Why do I need to provide GitHub and a real email?</h3>
+            <p>We require a public GitHub profile to verify your technical background. All confirmations are sent manually by the Founder (<a href='https://t.me/EfajTahamidRIFAT' style='color:#0ea5e9'>@EfajTahamidRIFAT</a>) via Telegram after reviewing your application.</p>
+        </div>
+        
+        <div class="faq">
+            <h3>Will I be selected if I apply?</h3>
+            <p>No. Submission is <strong>not final</strong> and does not guarantee selection. Only a limited number of highly qualified candidates are shortlisted. If selected, the Founder will respond to your Telegram message.</p>
+        </div>
+        
+        <div class="faq">
+            <h3>What happens after I submit my application?</h3>
+            <p>You will receive a verification receipt. Please DM <a href="https://t.me/EfajTahamidRIFAT" style="color:#0ea5e9">@EfajTahamidRIFAT</a> on Telegram for confirmation and next steps.</p>
+        </div>
+        
+        <div class="faq">
+            <h3>Where is Lunvex Labs based?</h3>
+            <p>Lunvex Labs is a global initiative with team members across multiple time zones. All collaboration happens remotely via official channels.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+INVESTORS_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Investors | Lunvex Labs</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background: #0f172a; 
+            color: white; 
+            margin: 0; 
+            padding: 0; 
+        }
+        .container { 
+            max-width: 800px; 
+            margin: 40px auto; 
+            padding: 0 20px; 
+        }
+        h1 { 
+            text-align: center; 
+            margin-bottom: 30px; 
+            color: #0ea5e9; 
+            font-weight: 700;
+        }
+        p { 
+            color: #cbd5e1; 
+            line-height: 1.7; 
+            margin-bottom: 20px; 
+        }
+        .highlight { 
+            background: rgba(14, 165, 233, 0.12); 
+            border-left: 3px solid #0ea5e9; 
+            padding: 18px; 
+            border-radius: 0 8px 8px 0;
+            margin: 24px 0;
+        }
+        .contact { 
+            background: rgba(14, 165, 233, 0.15); 
+            padding: 24px; 
+            border-radius: 16px; 
+            margin-top: 30px; 
+            text-align: center;
+        }
+        .contact a { 
+            color: #0ea5e9; 
+            text-decoration: underline; 
+            font-weight: 600;
+            font-size: 16px;
+        }
+        .nav { 
+            text-align: center; 
+            margin-bottom: 30px; 
+        }
+        .nav a { 
+            color: #94a3b8; 
+            text-decoration: none; 
+            margin: 0 15px; 
+        }
+        .nav a:hover { 
+            color: #0ea5e9; 
+        }
+        .disclaimer { 
+            font-size: 13px; 
+            color: #64748b; 
+            margin-top: 30px; 
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="nav">
+        <a href="/">Home</a> | 
+        <a href="/apply">Apply</a> | 
+        <a href="/faqs">FAQs</a> | 
+        <a href="/investors">Investors</a>
+    </div>
+    
+    <div class="container">
+        <h1>Strategic Investment Opportunity</h1>
+        
+        <p>
+            <strong>Lunvex Labs</strong> is a global technology initiative founded by <strong>Dewan Efaj Tahamid Rifat</strong>, 
+            focused on next-generation solutions in <strong>Cybersecurity, AI, and Web3 infrastructure</strong>.
+        </p>
+
+        <div class="highlight">
+            🔐 <strong>Ownership Structure</strong><br>
+            • Founder holds <strong>80%</strong> of the company<br>
+            • <strong>20% equity</strong> is reserved for strategic investors (18+ only)<br>
+            • No public token sale. No crowdfunding. Only direct, private participation.
+        </div>
+
+        <p>
+            We are not seeking passive capital — we seek <strong>aligned partners</strong> who believe in secure, 
+            decentralized innovation and can add strategic value beyond funding.
+        </p>
+
+        <p>
+            As a <em>“crypto hunter”</em>, the Founder prioritizes builders, security researchers, and visionaries 
+            who understand the intersection of trust, technology, and execution.
+        </p>
+
+        <div class="contact">
+            <strong>For qualified investors only:</strong><br>
+            Contact the Founder directly on Telegram:<br>
+            <a href="https://t.me/EfajTahamidRIFAT" target="_blank">@EfajTahamidRIFAT</a>
+        </div>
+
+        <div class="disclaimer">
+            <strong>Disclaimer:</strong> This page is an invitation for preliminary discussion only. 
+            No securities are offered or sold via this website. Investment opportunities, if any, 
+            will be presented under separate, confidential agreements compliant with applicable laws. 
+            You must be 18+ and accredited (where required) to participate.
+        </div>
+    </div>
+</body>
+</html>
+"""
+
 # ---------------- Routes ----------------
-@app.route("/", methods=["GET", "POST"])
-def index():
-    if request.method == "POST":
+@app.route("/")
+def home():
+    return render_template_string(HOME_TEMPLATE)
+
+@app.route("/apply", methods=["GET", "POST"])
+def apply():
+    if request.method == "GET":
+        token = secrets.token_urlsafe(32)
+        return render_template_string(APPLY_TEMPLATE, niches=NICHES, csrf_token=token)
+
+    # POST
+    token = request.form.get('csrf_token')
+    if not token or len(token) < 20:
+        abort(400)
+
+    try:
+        name = html.escape(request.form.get("name", "").strip()[:100])
+        email = html.escape(request.form.get("email", "").strip()[:100].lower())
+        role = request.form.get("role")
+        niche = request.form.get("niche")
+        sector = request.form.get("sector")
+        subsector = request.form.get("subsector") or ""
+        github_url = request.form.get("socials", "").strip()
+        agreed = request.form.get("agreement") == "on"
+
+        if not all([name, email, role, niche, sector, github_url]):
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ All fields are required.</h2>", 400
+
+        if role not in ["CoreTeam", "Internship"]:
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Invalid selection.</h2>", 400
+
+        if niche not in NICHES or sector not in NICHES[niche]:
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Invalid niche or specialization.</h2>", 400
+
+        if subsector and subsector not in NICHES[niche][sector]:
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Invalid sub-sector.</h2>", 400
+
+        if not is_valid_github_url(github_url):
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Provide a valid GitHub URL (e.g., https://github.com/yourname)</h2>", 400
+
+        if not agreed:
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Agreement is required.</h2>", 400
+
+        if role == "Internship" and request.form.get("unpaid_ack") != "on":
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Acknowledge unpaid nature.</h2>", 400
+
+        photo = request.files.get("photo")
+        signature = request.files.get("signature")
+        if not photo or not signature or not photo.filename or not signature.filename:
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Valid photo and signature required.</h2>", 400
+
+        if not (allowed_file(photo.filename) and allowed_file(signature.filename)):
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Only JPG/PNG allowed.</h2>", 400
+
+        photo_path = save_uploaded_file(photo, "photo")
+        signature_path = save_uploaded_file(signature, "signature")
+
+        if not (is_valid_image(photo_path) and is_valid_image(signature_path)):
+            os.remove(photo_path)
+            os.remove(signature_path)
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Invalid image format.</h2>", 400
+
+        applied_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        submission_id = f"LX{int(time.time())}_{hashlib.sha256(email.encode()).hexdigest()[:8]}"
+
         try:
-            name = html.escape(request.form.get("name", "").strip())
-            email = html.escape(request.form.get("email", "").strip())
-            role = request.form.get("role")
-            niche = request.form.get("niche")
-            sector = request.form.get("sector")
-            subsector = request.form.get("subsector") or ""
-            socials = html.escape(request.form.get("socials", "").strip())
-            agreed = request.form.get("agreement") == "on"
+            with get_db() as conn:
+                conn.execute("""
+                    INSERT INTO applicants 
+                    (submission_id, name, email, role, niche, sector, subsector, github_url, photo_path, signature_path, agreed, applied_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (submission_id, name, email, role, niche, sector, subsector, github_url, photo_path, signature_path, True, applied_at))
+                conn.commit()
+        except sqlite3.IntegrityError:
+            os.remove(photo_path)
+            os.remove(signature_path)
+            return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Already applied for this pathway.</h2>", 400
 
-            if not all([name, email, role, niche, sector, socials]):
-                return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ All fields are required.</h2>", 400
+        # Generate PDFs
+        internal_pdf = generate_internal_pdf({
+            "name": name,
+            "email": email,
+            "role": role,
+            "niche": niche,
+            "sector": sector,
+            "subsector": subsector,
+            "github_url": github_url,
+            "applied_at": applied_at
+        }, photo_path, signature_path, submission_id)
 
-            if role not in ["CoreTeam", "Internship"]:
-                return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Invalid selection.</h2>", 400
+        receipt_pdf = generate_receipt_pdf(name, role, email, submission_id)
 
-            if niche not in NICHES or sector not in NICHES[niche]:
-                return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Invalid niche or specialization.</h2>", 400
+        # Dropbox: per-user folder
+        user_folder = f"/LunvexLabs/submissions/{submission_id}/"
+        try:
+            dbx.files_create_folder_v2(user_folder)
+        except:
+            pass  # folder may exist
 
-            if subsector and subsector not in NICHES[niche][sector]:
-                return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Invalid sub-sector.</h2>", 400
+        upload_to_dropbox(internal_pdf, f"{user_folder}INTERNAL_RECORD.pdf")
+        upload_to_dropbox(receipt_pdf, f"{user_folder}RECEIPT.pdf")
+        upload_to_dropbox(photo_path, f"{user_folder}photo.jpg")
+        upload_to_dropbox(signature_path, f"{user_folder}signature.png")
+        backup_db()
 
-            if not agreed:
-                return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ You must agree to the agreement.</h2>", 400
+        # Cleanup
+        for f in [photo_path, signature_path, internal_pdf, receipt_pdf]:
+            if os.path.exists(f):
+                os.remove(f)
 
-            if role == "Internship" and request.form.get("unpaid_ack") != "on":
-                return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ You must acknowledge the unpaid nature of the internship.</h2>", 400
+        return f"""
+        <div style="max-width:600px;margin:60px auto;text-align:center;font-family:'Inter',sans-serif;
+                    background:rgba(15,23,42,0.85);padding:36px;border-radius:20px;color:white;">
+            <h2 style="color:#0ea5e9;font-weight:700;">✅ Application Submitted</h2>
+            <p style="font-size:16px;margin:16px 0;">Thank you, <strong>{html.escape(name)}</strong>!</p>
+            <p style="font-size:15px;color:#94a3b8;margin-top:20px;background:rgba(30,41,59,0.6);padding:16px;border-radius:12px;line-height:1.5;">
+              📌 <strong>This submission is not final.</strong><br>
+              Only shortlisted candidates will be contacted by the Founder on Telegram:<br>
+              <a href="https://t.me/EfajTahamidRIFAT" style="color:#0ea5e9;">@EfajTahamidRIFAT</a><br>
+              <em>Efaj will never DM you first — you must initiate contact.</em>
+            </p>
+            <p style="font-size:13px;color:#64748b;margin-top:20px;">
+                Submission ID: <code>{submission_id}</code>
+            </p>
+        </div>
+        <div style="text-align:center;margin-top:20px;">
+            <a href="/" style="color:#0ea5e9;">← Back to Home</a>
+        </div>
+        """
 
-            photo = request.files.get("photo")
-            signature = request.files.get("signature")
-            if not photo or not signature or not photo.filename or not signature.filename:
-                return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Valid photo and signature required.</h2>", 400
+    except Exception as e:
+        app.logger.exception("Submission failed")
+        return """
+        <div style="max-width:600px;margin:60px auto;text-align:center;font-family:'Inter',sans-serif;color:#ef4444;">
+            <h2>❌ Submission Failed</h2>
+            <p>An unexpected error occurred. Please try again.</p>
+            <a href="/apply" style="color:#0ea5e9;">← Try Again</a>
+        </div>
+        """, 500
 
-            if not (allowed_file(photo.filename) and allowed_file(signature.filename)):
-                return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Only JPG/PNG allowed.</h2>", 400
+@app.route("/faqs")
+def faqs():
+    return render_template_string(FAQ_TEMPLATE)
 
-            photo_path = save_uploaded_file(photo, "photo")
-            signature_path = save_uploaded_file(signature, "signature")
-
-            if not (is_valid_image(photo_path) and is_valid_image(signature_path)):
-                os.remove(photo_path)
-                os.remove(signature_path)
-                return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ Invalid image format.</h2>", 400
-
-            try:
-                with get_db_connection() as conn:
-                    conn.execute(
-                        """INSERT INTO applicants 
-                        (name, email, role, niche, sector, subsector, socials, photo, signature, agreed)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (name, email, role, niche, sector, subsector, socials, photo_path, signature_path, True)
-                    )
-                    conn.commit()
-            except sqlite3.IntegrityError:
-                os.remove(photo_path)
-                os.remove(signature_path)
-                return "<h2 style='text-align:center;color:#ef4444;margin:40px;'>❌ You've already applied for this pathway.</h2>", 400
-
-            # Generate unique submission ID
-            submission_id = f"LX{int(time.time())}"
-
-            # 1. Generate full agreement PDF
-            agreement_pdf = generate_agreement_pdf({
-                "name": name,
-                "email": email,
-                "role": role,
-                "niche": niche,
-                "sector": sector,
-                "subsector": subsector,
-                "socials": socials
-            }, photo_path, signature_path)
-
-            # 2. Generate colorful verification PDF
-            verification_pdf = generate_verification_pdf(name, role, email, submission_id)
-
-            # Upload both to Dropbox
-            for pdf_path in [agreement_pdf, verification_pdf]:
-                dropbox_path = f"/LunvexLabs/{os.path.basename(pdf_path)}"
-                with open(pdf_path, "rb") as f:
-                    dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode.overwrite)
-
-            return f"""
-            <div style="max-width:600px;margin:60px auto;text-align:center;font-family:'Inter',sans-serif;
-                        background:rgba(15,23,42,0.85);padding:36px;border-radius:20px;color:white;">
-                <h2 style="color:#0ea5e9;font-weight:700;">✅ Application Submitted</h2>
-                <p style="font-size:16px;margin:16px 0;">Thank you, <strong>{name}</strong>!</p>
-                <p>Your application has been securely processed.</p>
-                <p style="font-size:14px;color:#94a3b8;margin-top:20px;">
-                    Submission ID: <code>{submission_id}</code>
-                </p>
-                <p style="font-size:13px;color:#64748b;margin-top:24px;">
-                    Two PDFs have been generated and stored:<br>
-                    • Full agreement record<br>
-                    • Colorful verification receipt
-                </p>
-            </div>
-            """
-
-        except Exception as e:
-            app.logger.exception("Submission failed")
-            return """
-            <div style="max-width:600px;margin:60px auto;text-align:center;font-family:'Inter',sans-serif;color:#ef4444;">
-                <h2>❌ Submission Failed</h2>
-                <p>An unexpected error occurred. Please try again.</p>
-            </div>
-            """, 500
-
-    return render_template_string(
-        HTML_TEMPLATE,
-        niches=NICHES,
-        team_agreement=TEAM_AGREEMENT_HTML,
-        internship_agreement=INTERNSHIP_AGREEMENT_HTML
-    )
+@app.route("/investors")
+def investors():
+    return render_template_string(INVESTORS_TEMPLATE)
 
 # ---------------- Run ----------------
 if __name__ == "__main__":
     init_db()
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
